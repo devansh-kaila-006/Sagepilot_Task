@@ -63,9 +63,16 @@ async def websocket_endpoint(websocket: WebSocket, run_id: str, token: str = Que
         await websocket.close(code=1008)
         return
         
-    secret = os.getenv("SUPABASE_JWT_SECRET")
+    from fastapi.security import HTTPAuthorizationCredentials
+    from fastapi import HTTPException
+    from starlette.concurrency import run_in_threadpool
+    
     try:
-        jwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        await run_in_threadpool(get_current_user, creds)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
     except Exception:
         await websocket.close(code=1008)
         return

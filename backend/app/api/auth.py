@@ -14,22 +14,43 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
         
     token = credentials.credentials
-    secret = os.getenv("SUPABASE_JWT_SECRET")
+    import httpx
+    import logging
 
     try:
-        # Supabase uses HS256 for signing JWTs. We don't strictly verify the audience here 
-        # as it can vary, but we verify the signature against the secret.
-        payload = jwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
+        supabase_url = os.getenv("SUPABASE_URL")
+        anon_key = os.getenv("SUPABASE_ANON_KEY")
+        
+        if not supabase_url or not anon_key:
+            logging.error("Missing SUPABASE_URL or SUPABASE_ANON_KEY in env")
+            raise Exception("Server configuration error")
+
+        # Call Supabase to get the user
+        response = httpx.get(
+            f"{supabase_url}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": anon_key
+            }
         )
-    except jwt.InvalidTokenError:
+
+        if response.status_code != 200:
+            logging.error(f"Supabase auth failed: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        user_data = response.json()
+        return {"sub": user_data.get("id"), "role": user_data.get("role"), "email": user_data.get("email")}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"JWT Verification Error: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
+            detail="Server Error",
             headers={"WWW-Authenticate": "Bearer"},
         )

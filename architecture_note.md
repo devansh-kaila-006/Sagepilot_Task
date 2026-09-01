@@ -2,39 +2,53 @@
 
 ## Overview
 
-The Order Supervisor AI is designed to observe an order's lifecycle, evaluate incoming events asynchronously, take required actions, and sleep to conserve compute until necessary. It is designed as a scalable, fault-tolerant, and secure autonomous agent system.
+The Order Supervisor AI is designed to oversee a single order from creation until completion. It observes the order's lifecycle, evaluates incoming events asynchronously, executes required business actions, and sleeps to conserve compute until necessary. This architecture is designed to be a scalable, fault-tolerant, and reliable autonomous agent system.
 
-## Core Architectural Decisions
+This document outlines the core design decisions, orchestration choices, and tradeoff reasoning in alignment with the project requirements.
 
-### 1. Orchestration: Database Polling + LangGraph
+---
 
-**Why not Temporal?**
-Temporal is the gold standard for durable, long-running workflow orchestration. However, setting up a Temporal cluster for a Proof of Concept (POC) adds significant overhead and infrastructure requirements.
+## 1. Orchestration Choices and Justification
 
-**The Alternative Choice:**
-We opted for a **Database-Backed State Machine** combined with a **FastAPI Background Poller** and **LangGraph**.
-- **LangGraph** naturally handles cyclic agent workflows, memory persistence, and tool execution.
-- **FastAPI Background Tasks & APScheduler** act as the workflow runner. When an agent calls `sleep()`, the runtime saves `next_wake_at` to the database and exits. The poller constantly checks the DB for runs that have passed their wake time, and re-triggers them.
-- **Concurrency & Leasing:** Multi-worker deployments (e.g. Render, AWS) are handled gracefully via a Row-Level DB lease (`UPDATE ... SET status='processing'`). This guarantees isolated execution.
-- **Fault-Tolerance:** A stale processing sweep ensures that if a worker dies mid-execution, the orphaned run is cleanly unlocked and recovered by the cluster.
+**The Requirement:** The system must support long-running execution, event-driven wake-up, scheduled wake-up, interruption/termination, and reliable state transitions.
 
-### 2. State & Memory Management
+**The Choice: Database-Backed State Machine + Cron/Scheduler (APScheduler) + LangGraph**
 
-- **The Activity Log Ledger:** Instead of maintaining disparate tables for events, actions, and messages, a single append-only `activities` table acts as an immutable ledger for the run.
-- **Context Compaction:** As the log grows beyond 20 events, the system automatically uses a lightweight LLM to summarize older events. The compaction state uses absolute IDs (`last_compacted_id`) rather than array indices, ensuring perfect resilience against drift or mid-cycle injected events. The agent maintains infinite-horizon context without blowing out the token limit.
+**Justification & Tradeoff Reasoning:**
+While dedicated workflow engines like **Temporal** are the industry gold standard for durable, long-running execution, setting up a cluster for a Proof of Concept adds significant infrastructure overhead. The prompt explicitly allowed *database state plus cron or scheduler* as a valid alternative, which is precisely the orchestration model chosen here.
 
-### 3. Wake / Sleep Classifier (Two-Tier LLM Architecture)
+- **FastAPI Background Tasks & APScheduler:** Act as the workflow runner. When an agent decides to sleep, it calls a tool that saves a 
+ext_wake_at timestamp to the database and cleanly exits the process. A background poller constantly sweeps the DB for runs that have passed their wake time, triggering execution.
+- **Concurrency & Leasing:** Multi-worker deployments are handled gracefully via a Row-Level database lease (UPDATE ... SET status='processing' WHERE status='sleeping'). This guarantees isolated, mutually-exclusive execution.
+- **Crash Recovery:** A stale processing sweep ensures that if a worker node dies mid-execution, the orphaned run is cleanly unlocked (status='processing' for >X minutes) and recovered by the cluster on the next sweep.
 
-- **Classifier Bouncer (`gemini-3.1-flash-lite`)**: A rapid, cheap model evaluates every incoming event against the run's current context. It acts as a gatekeeper, determining if the event warrants waking the expensive reasoning agent or if it can be safely ignored ("SLEEP").
-- **Main Agent (`gemini-3.6-flash`)**: The core reasoning engine. Only powers up when business logic dictates action is required, heavily optimizing API costs and latency.
+*Tradeoff:* Polling a database every 10 seconds is perfectly acceptable and highly resilient for early production, but it incurs a fixed IO cost and won't scale elegantly to tens of millions of concurrent runs. A hyper-scale system would transition this scheduling layer to AWS SQS/RabbitMQ with Delayed Messages or Temporal, but the underlying database schema and agent logic would remain identical.
 
-### 4. API & Security Design
+## 2. Agent Orchestration & Long-Running Run Modeling
 
-- **REST & WebSockets**: The API uses RESTful endpoints mapped directly to Next.js capabilities, alongside a live WebSocket stream for realtime terminal output.
-- **Strict Authentication**: All backend routes and WebSocket connections are protected by Supabase JWT validation. 
-- **Row Level Security (RLS)**: The database itself is locked down against malicious anonymous access via explicit `Deny` policies, enforcing that all data modifications travel exclusively through the authenticated FastAPI layer.
+**The Choice: LangGraph**
 
-## Tradeoffs
+**Justification:**
+Instead of a raw while loop calling the OpenAI/Gemini API, **LangGraph** was chosen to model the agent runtime as a cyclic graph. 
+- It naturally handles cyclic agent workflows, structured tool bindings (e.g., 	ool_message_fulfillment_team), and memory persistence.
+- It makes future expansions (like adding specialized Supervisor sub-agents or human-in-the-loop checkpoints) trivial to implement via graph nodes.
 
-- **Polling vs. Event-Driven Messaging:** Polling the DB every 10 seconds is acceptable for early production but won't scale elegantly to millions of concurrent runs. A real hyper-scale system would use AWS SQS / RabbitMQ with Delayed Messages or Temporal.
-- **Agent Framework:** Using LangGraph is slightly heavier than a raw OpenAI/Gemini API loop, but it provides built-in tool bindings and a state graph that makes future expansions (like adding a specialized Researcher sub-agent) trivial.
+*Tradeoff:* LangGraph introduces a slight learning curve and overhead compared to raw API calls, but the robust structured outputs and state management capabilities far outweigh the complexity for a production-grade agent.
+
+## 3. Event Handling: Two-Tier Wake/Sleep Classifier
+
+To prevent the expensive main reasoning agent from waking up for trivial or duplicate events, a **Two-Tier LLM Architecture** is employed:
+
+- **Classifier Bouncer (gemini-3.1-flash-lite)**: A rapid, cheap model evaluates every incoming event against the run's current context. It acts as a gatekeeper, determining if the event warrants waking the main agent or if it can be safely ignored (returning "SLEEP").
+- **Main Agent (gemini-3.6-flash)**: The core reasoning engine. Only powers up when the classifier deems an event important, heavily optimizing API costs and latency.
+
+## 4. State and Memory Design
+
+Maintaining context over a long-running order (which could span weeks) requires careful token management.
+
+- **The Activity Log Ledger:** Instead of maintaining disparate tables for events, actions, and messages, a single append-only ctivities table acts as an immutable ledger for the run.
+- **Context Compaction Strategy:** As the activity log grows beyond a set threshold (e.g., 20 events), the system automatically triggers a lightweight LLM task to summarize older events. The compaction state uses absolute database IDs (last_compacted_id) rather than array indices, ensuring perfect resilience against drift or mid-cycle injected events. The agent maintains an infinite-horizon context without blowing out the token limit.
+
+## 5. Security and Access
+
+- **Row Level Security (RLS)**: The database is locked down with explicit Postgres RLS policies, enforcing that frontend clients can read real-time updates via Supabase WebSockets, but all data modifications must travel exclusively through the authenticated FastAPI layer.
