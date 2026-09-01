@@ -52,12 +52,15 @@ async def client(db_session):
         yield db_session
 
     app.dependency_overrides[get_db] = override_get_db
-    # Endpoints verify Supabase-style HS256 JWTs; mint one signed with the
-    # same secret the app verifies against (loaded via app.main's load_dotenv).
-    import jwt as pyjwt
-    secret = os.getenv("SUPABASE_JWT_SECRET")
-    token = pyjwt.encode({"sub": "test-user", "role": "authenticated"}, secret, algorithm="HS256")
+    
+    # Override get_current_user to bypass Supabase auth during tests
+    from app.api.auth import get_current_user
+    async def override_get_current_user():
+        return {"sub": "test-user", "role": "authenticated"}
+    
+    app.dependency_overrides[get_current_user] = override_get_current_user
+
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
-                           headers={"Authorization": f"Bearer {token}"}) as ac:
+                           headers={"Authorization": "Bearer dummy_token"}) as ac:
         yield ac
     app.dependency_overrides.clear()
