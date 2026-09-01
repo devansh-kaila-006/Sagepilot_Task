@@ -1,72 +1,48 @@
 # Order Supervisor AI (POC)
 
-A long-running AI supervisor that manages the lifecycle of orders. 
-Built with FastAPI, LangGraph, PostgreSQL, and Next.js.
+An autonomous AI agent designed to oversee the lifecycle of e-commerce orders. Built with FastAPI (backend), Next.js (frontend), Supabase (PostgreSQL DB), and LangGraph (agent orchestration).
 
-## Prerequisites
+## Architecture
 
-- Python 3.10+
-- Node.js 18+
-- Docker (optional, but no longer required as we use Supabase)
-- OpenAI API Key
+This project utilizes a two-tier LLM architecture powered by Google Gemini:
+1. **Classifier Model (`gemini-3.1-flash-lite`)**: A fast, low-cost model used to route incoming events. It decides if an event is trivial ("SLEEP") or requires business logic ("WAKE"), preserving the main agent's quota.
+2. **Main Agent (`gemini-3.6-flash`)**: The core reasoning engine. Wakes up when necessary to assess context, invoke tools (messaging teams, logging notes), and decide when to sleep or complete the run.
 
-### 1. Database (Supabase)
+### Concurrency & State Management
+- **Per-Run Isolation**: Each order lifecycle (Run) operates completely independently with an isolated `run_id` lock to prevent state bleed during event bursts.
+- **Terminate/Fallback Design**: Mid-cycle completions correctly abort trailing actions via database-level termination guards. A fallback cron job (Poller) ensures sleeping runs wake up safely.
+- **Context Compaction**: As the event log grows, older events are dynamically summarized and stored in `run.state["compacted_summary"]` to prevent LLM context bloat and hallucination on long-running orders.
 
-Since this POC uses Supabase:
-1. Create a project at [Supabase](https://supabase.com/).
-2. Copy the **Transaction Connection String** from your Database settings.
-3. Copy the **Project URL** and **Anon Key** from your API settings (if you want real-time UI updates).
+## Setup Instructions
 
-### 2. Backend (FastAPI + LangGraph)
-
-Create a `.env` file in the `backend/` directory:
-```
-OPENAI_API_KEY=your-api-key-here
-DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-region.pooler.supabase.com:6543/postgres
-```
-
-Install dependencies and run:
+### 1. Backend Setup
 ```bash
 cd backend
 python -m venv venv
-# Windows
-.\venv\Scripts\activate
-# Mac/Linux
-source venv/bin/activate
-
-pip install -r requirements.txt # (or manually install the packages listed in the code)
-uvicorn app.main:app --reload
+.\venv\Scripts\activate  # Windows
+# source venv/bin/activate # Mac/Linux
+pip install -r requirements.txt
 ```
 
-### 3. Frontend (Next.js)
-
-Create a `.env.local` file in the `frontend/` directory for real-time UI:
+### 2. Environment Variables
+Copy `.env.example` to `.env` in the `backend/` directory:
 ```
-NEXT_PUBLIC_SUPABASE_URL=your-supabase-url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
+DATABASE_URL=postgresql+asyncpg://postgres:[YOUR-PASSWORD]@db.xxxx.supabase.co:5432/postgres
+GEMINI_API_KEY=your_gemini_api_key
+AGENT_MODEL=gemini-3.6-flash
+CLASSIFIER_MODEL=gemini-3.1-flash-lite
 ```
 
-Install dependencies and run:
+### 3. Run the Backend
+```bash
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 4. Run the Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-The UI will be available at [http://localhost:3000](http://localhost:3000).
-
-## Usage Guide (Walkthrough)
-
-1. Open the UI at `http://localhost:3000`.
-2. Click **"+ Create Demo"** to create a supervisor template.
-3. Click **"Start New Run"** on the supervisor card.
-4. The run will appear in the "Active Runs" column. Click it to enter the Run Details page.
-5. In the Run Details view, you will see a `run_started` event and the Agent's response.
-6. Use the **Inject Event** dropdown to simulate system events (e.g. `payment_failed`).
-7. Watch the Activity Log populate as the Agent wakes up, reasons, executes tools (like `message_customer`), and goes back to sleep.
-8. Use the **Add Instruction** box to steer the agent mid-flight (e.g., "Do not message the customer for the next 24 hours").
-9. Click the **Terminate** button in the top right to end the run gracefully.
-
-## Architecture
-
-See `architecture_note.md` for detailed design decisions.
+Navigate to `http://localhost:3000` to interact with the dashboard.
