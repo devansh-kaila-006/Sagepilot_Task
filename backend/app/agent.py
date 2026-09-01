@@ -48,7 +48,7 @@ async def _record_action(run_id: str, action_name: str, payload: dict):
     async with async_session() as db:
         result = await db.execute(select(models.Run).where(models.Run.id == run_id))
         run = result.scalars().first()
-        if run and run.status in ["completed", "terminated"]:
+        if run and run.status == "completed":
             logger.warning(f"Run {run_id} is already {run.status}. Aborting action {action_name}.")
             return False
             
@@ -96,7 +96,7 @@ async def sleep_until(run_id: str, hours: float):
         result = await db.execute(select(models.Run).where(models.Run.id == run_id))
         run = result.scalars().first()
         
-        if run and run.status in ["completed", "terminated"]:
+        if run and run.status == "completed":
             logger.warning(f"Run {run_id} is already {run.status}. Aborting sleep_until.")
             return f"Run is already {run.status}, cannot sleep."
 
@@ -245,7 +245,7 @@ async def tool_executor_node(state: AgentState):
             async with async_session() as db:
                 result = await db.execute(select(models.Run).where(models.Run.id == state["run_id"]))
                 run = result.scalars().first()
-                if run and run.status in ["completed", "terminated"]:
+                if run and run.status == "completed":
                     logger.warning(f"Run {state['run_id']} is already {run.status}. Ignoring redundant complete.")
                 elif run:
                     run.status = "completed"
@@ -344,7 +344,6 @@ async def trigger_agent(run_id: str):
     lock = get_run_lock(run_id)
         
     async with lock:
-        print(f"\n\n==== HELLO FROM TRIGGER AGENT: {run_id} ====\n\n")
         logger.info(f"Triggering agent for run {run_id}")
         
         async with async_session() as db:
@@ -356,23 +355,45 @@ async def trigger_agent(run_id: str):
             
             sup_result = await db.execute(select(models.Supervisor).where(models.Supervisor.id == run.supervisor_id))
             supervisor = sup_result.scalars().first()
-        
+            
             act_result = await db.execute(select(models.Activity).where(models.Activity.run_id == run_id).order_by(models.Activity.created_at.desc()).limit(100))
-            all_activities = act_result.scalars().all()
+            all_activities = list(act_result.scalars().all())
             all_activities.reverse() # chronological order
         
-            # Context Compaction: If we have > 20 activities, we summarize the older ones
-            # to prevent the LLM context from growing indefinitely.
+            state_dict = dict(run.state) if run.state else {}
+            compacted_summary = state_dict.get("compacted_summary", "")
+            compact_idx = state_dict.get("compact_idx", 0)
+
+            # Context Compaction: If we have > 20 activities, summarize older ones
             if len(all_activities) > 20:
-                logger.info("Compacting context...")
-                older_activities = all_activities[:-15] # keep last 15 intact
+                cutoff_idx = len(all_activities) - 15
+                activities_to_compact = all_activities[compact_idx:cutoff_idx]
+                
+                if activities_to_compact:
+                    logger.info(f"Compacting {len(activities_to_compact)} events into summary...")
+                    act_strs = "\n".join([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in activities_to_compact])
+                    
+                    llm_compactor = ChatGoogleGenerativeAI(model=CLASSIFIER_MODEL, temperature=0)
+                    sys_msg = SystemMessage(content="You are an AI summarizing an e-commerce order event log. "
+                                            "Merge these new events into the existing summary (if any). "
+                                            "Keep it concise. Retain critical facts (payment status, delays, customer notes).")
+                    prompt = f"Existing Summary: {compacted_summary}\n\nNew Events to add:\n{act_strs}"
+                    resp = await llm_compactor.ainvoke([sys_msg, HumanMessage(content=prompt)])
+                    
+                    content = resp.content
+                    if isinstance(content, list):
+                        content = " ".join([b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"])
+                    
+                    compacted_summary = content.strip()
+                    
+                    state_dict["compacted_summary"] = compacted_summary
+                    state_dict["compact_idx"] = cutoff_idx
+                    # PostgreSQL JSON/JSONB updates require flag_modified or re-assignment
+                    run.state = state_dict
+                    await db.commit()
+                
                 recent_activities = all_activities[-15:]
-            
-                # (In a real implementation, we would use an LLM here to summarize `older_activities` into a single text block and store it in run.state)
-                # For this POC, we'll simulate the compaction:
-                compacted_summary = f"[COMPACTED SUMMARY] {len(older_activities)} older events occurred, including order creation and initial steps."
-            
-                activity_strings = [compacted_summary]
+                activity_strings = [f"--- COMPACTED HISTORY ---\n{compacted_summary}\n--- RECENT EVENTS ---"]
                 activity_strings.extend([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in recent_activities])
                 activity_str = "\n".join(activity_strings)
             else:

@@ -6,7 +6,7 @@ raw_db_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://myuser:mypassword@l
 if raw_db_url.startswith("postgresql://"):
     raw_db_url = raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-engine = create_async_engine(raw_db_url, echo=True)
+engine = create_async_engine(raw_db_url, echo=False)
 async_session = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )

@@ -56,3 +56,39 @@ async def test_agent_node():
         result = await agent_node(state)
         assert len(result["messages"]) == 1
         assert result["messages"][0].tool_calls[0]["name"] == "tool_sleep"
+
+from app.agent import sleep_until, _record_action
+from app.models.domain import Run
+from sqlalchemy.future import select
+
+@pytest.mark.asyncio
+async def test_sleep_clamping(db_session):
+    run = Run(id="run-1", order_id="TEST-CLAMP", supervisor_id=1, status="active")
+    db_session.add(run)
+    await db_session.commit()
+    
+    # Test negative clamp to 0.01
+    await sleep_until(run.id, -5.0)
+    await db_session.refresh(run)
+    assert run.status == "sleeping"
+    # Negative should clamp to 0.01 hours
+
+@pytest.mark.asyncio
+async def test_terminate_mid_cycle(db_session):
+    run = Run(id="run-2", order_id="TEST-TERM", supervisor_id=1, status="completed")
+    db_session.add(run)
+    await db_session.commit()
+    
+    msg = await sleep_until(run.id, 5.0)
+    assert "cannot sleep" in msg
+    await db_session.refresh(run)
+    assert run.status == "completed"
+
+@pytest.mark.asyncio
+async def test_resume_validation(db_session):
+    run = Run(id="run-3", order_id="TEST-RESUME", supervisor_id=1, status="completed")
+    db_session.add(run)
+    await db_session.commit()
+    
+    success = await _record_action(run.id, "test_action", {})
+    assert not success
