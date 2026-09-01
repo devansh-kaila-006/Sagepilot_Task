@@ -29,8 +29,18 @@ Copy `.env.example` to `.env` in the `backend/` directory:
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:[YOUR-PASSWORD]@db.xxxx.supabase.co:5432/postgres
 GEMINI_API_KEY=your_gemini_api_key
-AGENT_MODEL=gemini-3.6-flash
-CLASSIFIER_MODEL=gemini-3.1-flash-lite
+
+# Optional: Override the default models used for the main agent and the classifier
+# AGENT_MODEL=gemini-3.6-flash
+# CLASSIFIER_MODEL=gemini-3.1-flash-lite
+
+# Optional: For Auth
+# SUPABASE_JWT_SECRET=your_jwt_secret
+
+# Optional: For LangSmith Observability
+# LANGCHAIN_TRACING_V2=true
+# LANGCHAIN_API_KEY=your_langsmith_api_key
+# LANGCHAIN_PROJECT=sagepilot-poc
 ```
 
 ### 3. Run the Backend

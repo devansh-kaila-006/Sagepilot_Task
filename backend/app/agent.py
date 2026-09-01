@@ -12,6 +12,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from .services.pubsub import pubsub_broker
 
 from .core.database import async_session
 from .models import domain as models
@@ -418,9 +419,32 @@ async def trigger_agent(run_id: str):
             }
         
         try:
-            final_state = await graph.ainvoke(initial_state)
+            async for event in graph.astream_events(initial_state, version="v2"):
+                kind = event["event"]
+                name = event["name"]
+                
+                if kind in ["on_chat_model_stream", "on_tool_start", "on_tool_end"]:
+                    data = event.get("data", {})
+                    chunk = data.get("chunk")
+                    
+                    payload = {
+                        "kind": kind,
+                        "name": name,
+                        "run_id": run_id
+                    }
+                    
+                    if kind == "on_chat_model_stream" and chunk:
+                        content = chunk.content
+                        if isinstance(content, str) and content:
+                            payload["content"] = content
+                    elif kind == "on_tool_start":
+                        payload["input"] = data.get("input")
+                    elif kind == "on_tool_end":
+                        payload["output"] = str(data.get("output"))
+                        
+                    await pubsub_broker.publish(run_id, payload)
+
             logger.info(f"Agent finished graph execution for {run_id}.")
-            # Note: Sleep/Complete tool handles DB updates.
         except Exception as e:
             logger.error(f"Error executing agent: {e}")
         finally:
