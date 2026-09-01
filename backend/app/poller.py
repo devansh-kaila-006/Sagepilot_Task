@@ -27,7 +27,7 @@ async def poll_sleeping_runs():
         stale_threshold = now - timedelta(minutes=5)
         stale_result = await db.execute(
             select(models.Run)
-            .where(models.Run.status == "active")
+            .where(models.Run.status.in_(["active", "processing"]))
             .where(models.Run.next_wake_at.is_(None))
             .where(models.Run.updated_at < stale_threshold)
         )

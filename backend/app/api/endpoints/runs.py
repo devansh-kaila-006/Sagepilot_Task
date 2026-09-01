@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect, Query
+import jwt
+import os
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Dict, Any
 from ...schemas import domain as schemas
@@ -56,7 +58,18 @@ async def resume_run(run_id: str, background_tasks: BackgroundTasks, db: AsyncSe
     return APIResponse(success=True, message="Run resumed")
 
 @router.websocket("/{run_id}/stream")
-async def websocket_endpoint(websocket: WebSocket, run_id: str):
+async def websocket_endpoint(websocket: WebSocket, run_id: str, token: str = Query(None)):
+    if not token:
+        await websocket.close(code=1008)
+        return
+        
+    secret = os.getenv("SUPABASE_JWT_SECRET")
+    try:
+        jwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
+    except Exception:
+        await websocket.close(code=1008)
+        return
+        
     await websocket.accept()
     q = pubsub_broker.subscribe(run_id)
     try:

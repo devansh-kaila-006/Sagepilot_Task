@@ -24,12 +24,7 @@ logger = logging.getLogger(__name__)
 AGENT_MODEL = os.getenv("AGENT_MODEL", "gemini-3.6-flash")
 CLASSIFIER_MODEL = os.getenv("CLASSIFIER_MODEL", "gemini-3.1-flash-lite")
 
-run_locks = {}
 
-def get_run_lock(run_id: str):
-    if run_id not in run_locks:
-        run_locks[run_id] = asyncio.Lock()
-    return run_locks[run_id]
 
 # --- State Definition ---
 class AgentState(TypedDict):
@@ -170,7 +165,15 @@ tools = [
 async def classifier_node(state: AgentState):
     """Lightweight step to decide if the event is important enough to wake the main agent."""
     recent_activities_list = state['recent_activities'].strip().split("\n")
-    if recent_activities_list and "INSTRUCTION:" in recent_activities_list[-1]:
+    # Judge by the last EVENT/INSTRUCTION line, not the last line: a queued cycle
+    # runs after the previous cycle logged its sleep/wake entries, which would
+    # otherwise mask the event that actually triggered this wake.
+    last_event_line = ""
+    for line in reversed(recent_activities_list):
+        if "] EVENT:" in line or "] INSTRUCTION:" in line:
+            last_event_line = line
+            break
+    if "INSTRUCTION:" in last_event_line:
         return {"wake_decision": "WAKE"}
 
     llm = ChatGoogleGenerativeAI(model=CLASSIFIER_MODEL, temperature=0)
@@ -180,7 +183,8 @@ You are an event router for an Order Supervisor.
 Recent Activities:
 {state['recent_activities']}
 
-Look at the last event. If it is trivial and requires no action, output "SLEEP".
+Look at this event: {last_event_line or "(none found)"}
+If it is trivial and requires no action, output "SLEEP".
 If it might require business logic, communication, or state updates, output "WAKE".
 Only output "WAKE" or "SLEEP".
 """)
@@ -342,117 +346,142 @@ async def trigger_agent(run_id: str):
     Called by the FastAPI endpoints or the background poller.
     It reads DB state, formats it, runs the LangGraph, and updates DB state.
     """
-    lock = get_run_lock(run_id)
-        
-    async with lock:
-        logger.info(f"Triggering agent for run {run_id}")
-        
+    logger.info(f"Triggering agent for run {run_id}")
+
+    from sqlalchemy import update
+    # DB Lease: claim the run by flipping status to 'processing'. If another
+    # cycle holds the lease, wait for it to finish so the event that triggered
+    # us is not dropped until the next scheduled wake.
+    claimed = False
+    for attempt in range(10):
         async with async_session() as db:
-            result = await db.execute(select(models.Run).where(models.Run.id == run_id))
-            run = result.scalars().first()
-            if not run or run.status not in ["active", "sleeping"]:
-                logger.info("Run not found or not active.")
-                return
-            
-            sup_result = await db.execute(select(models.Supervisor).where(models.Supervisor.id == run.supervisor_id))
-            supervisor = sup_result.scalars().first()
-            
-            act_result = await db.execute(select(models.Activity).where(models.Activity.run_id == run_id).order_by(models.Activity.created_at.desc()).limit(100))
-            all_activities = list(act_result.scalars().all())
-            all_activities.reverse() # chronological order
-        
-            state_dict = dict(run.state) if run.state else {}
-            compacted_summary = state_dict.get("compacted_summary", "")
-            compact_idx = state_dict.get("compact_idx", 0)
-
-            # Context Compaction: If we have > 20 activities, summarize older ones
-            if len(all_activities) > 20:
-                cutoff_idx = len(all_activities) - 15
-                activities_to_compact = all_activities[compact_idx:cutoff_idx]
-                
-                if activities_to_compact:
-                    logger.info(f"Compacting {len(activities_to_compact)} events into summary...")
-                    act_strs = "\n".join([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in activities_to_compact])
-                    
-                    llm_compactor = ChatGoogleGenerativeAI(model=CLASSIFIER_MODEL, temperature=0)
-                    sys_msg = SystemMessage(content="You are an AI summarizing an e-commerce order event log. "
-                                            "Merge these new events into the existing summary (if any). "
-                                            "Keep it concise. Retain critical facts (payment status, delays, customer notes).")
-                    prompt = f"Existing Summary: {compacted_summary}\n\nNew Events to add:\n{act_strs}"
-                    resp = await llm_compactor.ainvoke([sys_msg, HumanMessage(content=prompt)])
-                    
-                    content = resp.content
-                    if isinstance(content, list):
-                        content = " ".join([b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"])
-                    
-                    compacted_summary = content.strip()
-                    
-                    state_dict["compacted_summary"] = compacted_summary
-                    state_dict["compact_idx"] = cutoff_idx
-                    # PostgreSQL JSON/JSONB updates require flag_modified or re-assignment
-                    run.state = state_dict
-                    await db.commit()
-                
-                recent_activities = all_activities[-15:]
-                activity_strings = [f"--- COMPACTED HISTORY ---\n{compacted_summary}\n--- RECENT EVENTS ---"]
-                activity_strings.extend([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in recent_activities])
-                activity_str = "\n".join(activity_strings)
-            else:
-                activity_str = "\n".join([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in all_activities])
-        
-            run.status = "active"
-            run.next_wake_at = None
+            result = await db.execute(
+                update(models.Run)
+                .where(models.Run.id == run_id)
+                .where(models.Run.status.in_(["active", "sleeping"]))
+                .values(status="processing")
+                .execution_options(synchronize_session="fetch")
+            )
             await db.commit()
-        
-            # In a real app we'd load `run.state["messages"]` here, but for this POC we can just 
-            # let the agent read the recent activity log on every wake. 
-            # This acts as a compacted context mechanism automatically.
-        
-            initial_state = {
-                "messages": [HumanMessage(content="A new event has arrived or a timer has popped. Review the context and decide your actions.")],
-                "run_id": run_id,
-                "order_id": run.order_id,
-                "supervisor_instruction": supervisor.base_instruction if supervisor else "",
-                "recent_activities": activity_str,
-                "next_wake_at": None,
-                "completed": False
-            }
-        
-        try:
-            async for event in graph.astream_events(initial_state, version="v2"):
-                kind = event["event"]
-                name = event["name"]
-                
-                if kind in ["on_chat_model_stream", "on_tool_start", "on_tool_end"]:
-                    data = event.get("data", {})
-                    chunk = data.get("chunk")
-                    
-                    payload = {
-                        "kind": kind,
-                        "name": name,
-                        "run_id": run_id
-                    }
-                    
-                    if kind == "on_chat_model_stream" and chunk:
-                        content = chunk.content
-                        if isinstance(content, str) and content:
-                            payload["content"] = content
-                    elif kind == "on_tool_start":
-                        payload["input"] = data.get("input")
-                    elif kind == "on_tool_end":
-                        payload["output"] = str(data.get("output"))
-                        
-                    await pubsub_broker.publish(run_id, payload)
+            if result.rowcount > 0:
+                claimed = True
+                break
+            run_check = (await db.execute(select(models.Run).where(models.Run.id == run_id))).scalars().first()
+        if not run_check or run_check.status not in ["processing", "active", "sleeping"]:
+            logger.info(f"Run {run_id} is {run_check.status if run_check else 'gone'}; not claiming.")
+            return
+        logger.info(f"Run {run_id} busy (processing); retry {attempt + 1}/10 in 4s.")
+        await asyncio.sleep(4)
+    if not claimed:
+        logger.warning(f"Run {run_id} still processing after retries; event will be picked up at next wake.")
+        return
 
-            logger.info(f"Agent finished graph execution for {run_id}.")
-        except Exception as e:
-            logger.error(f"Error executing agent: {e}")
-        finally:
-            # Fallback: if run is still active (orphaned), force sleep
-            async with async_session() as db2:
-                result = await db2.execute(select(models.Run).where(models.Run.id == run_id))
-                run_check = result.scalars().first()
-                if run_check and run_check.status == "active":
-                    logger.warning(f"Run {run_id} left active without sleep/complete. Forcing fallback sleep.")
-                    await sleep_until(run_id, 1.0)
+    async with async_session() as db:
+        result = await db.execute(select(models.Run).where(models.Run.id == run_id))
+        run = result.scalars().first()
+        
+        sup_result = await db.execute(select(models.Supervisor).where(models.Supervisor.id == run.supervisor_id))
+        supervisor = sup_result.scalars().first()
+        
+        state_dict = dict(run.state) if run.state else {}
+        compacted_summary = state_dict.get("compacted_summary", "")
+        last_compacted_id = state_dict.get("last_compacted_id", 0)
+
+        query = select(models.Activity).where(models.Activity.run_id == run_id).order_by(models.Activity.id.asc())
+        if last_compacted_id > 0:
+            query = query.where(models.Activity.id > last_compacted_id)
+
+        act_result = await db.execute(query)
+        uncompacted_activities = list(act_result.scalars().all())
+
+        # Context Compaction: If we have > 20 activities since last compaction
+        if len(uncompacted_activities) > 20:
+            activities_to_compact = uncompacted_activities[:-10] # Keep last 10
+            recent_activities = uncompacted_activities[-10:]
+            
+            if activities_to_compact:
+                logger.info(f"Compacting {len(activities_to_compact)} events into summary...")
+                act_strs = "\n".join([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in activities_to_compact])
+                
+                llm_compactor = ChatGoogleGenerativeAI(model=CLASSIFIER_MODEL, temperature=0)
+                sys_msg = SystemMessage(content="You are an AI summarizing an e-commerce order event log. "
+                                        "Merge these new events into the existing summary (if any). "
+                                        "Keep it concise. Retain critical facts (payment status, delays, customer notes).")
+                prompt = f"Existing Summary: {compacted_summary}\n\nNew Events to add:\n{act_strs}"
+                resp = await llm_compactor.ainvoke([sys_msg, HumanMessage(content=prompt)])
+                
+                content = resp.content
+                if isinstance(content, list):
+                    content = " ".join([b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"])
+                
+                compacted_summary = content.strip()
+                
+                state_dict["compacted_summary"] = compacted_summary
+                state_dict["last_compacted_id"] = activities_to_compact[-1].id
+                run.state = state_dict
+                await db.commit()
+            
+            activity_strings = [f"--- COMPACTED HISTORY ---\n{compacted_summary}\n--- RECENT EVENTS ---"]
+            activity_strings.extend([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in recent_activities])
+            activity_str = "\n".join(activity_strings)
+        else:
+            activity_strings = []
+            if compacted_summary:
+                activity_strings.append(f"--- COMPACTED HISTORY ---\n{compacted_summary}\n--- RECENT EVENTS ---")
+            activity_strings.extend([f"[{a.created_at.isoformat()}] {a.type.upper()}: {json.dumps(a.payload)}" for a in uncompacted_activities])
+            activity_str = "\n".join(activity_strings)
+    
+
+        
+        run.status = "processing"
+        run.next_wake_at = None
+        await db.commit()
+    
+        initial_state = {
+            "messages": [HumanMessage(content="A new event has arrived or a timer has popped. Review the context and decide your actions.")],
+            "run_id": run_id,
+            "order_id": run.order_id,
+            "supervisor_instruction": supervisor.base_instruction if supervisor else "",
+            "recent_activities": activity_str,
+            "next_wake_at": None,
+            "completed": False
+        }
+        
+    try:
+        async for event in graph.astream_events(initial_state, version="v2"):
+            kind = event["event"]
+            name = event["name"]
+
+            if kind in ["on_chat_model_stream", "on_tool_start", "on_tool_end"]:
+                data = event.get("data", {})
+                chunk = data.get("chunk")
+
+                payload = {
+                    "kind": kind,
+                    "name": name,
+                    "run_id": run_id
+                }
+
+                if kind == "on_chat_model_stream" and chunk:
+                    content = chunk.content
+                    if isinstance(content, str) and content:
+                        payload["content"] = content
+                elif kind == "on_tool_start":
+                    payload["input"] = data.get("input")
+                elif kind == "on_tool_end":
+                    payload["output"] = str(data.get("output"))
+
+                await pubsub_broker.publish(run_id, payload)
+
+        logger.info(f"Agent finished graph execution for {run_id}.")
+    except Exception as e:
+        logger.error(f"Error executing agent: {e}")
+    finally:
+        # Fallback: if run is still processing (orphaned), force sleep
+        async with async_session() as db2:
+            result = await db2.execute(select(models.Run).where(models.Run.id == run_id))
+            run_check = result.scalars().first()
+            if run_check and run_check.status == "processing":
+                logger.warning(f"Run {run_id} left processing without sleep/complete. Forcing fallback sleep.")
+                await sleep_until(run_id, 1.0)
 
