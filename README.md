@@ -45,6 +45,7 @@ GEMINI_API_KEY=your_gemini_api_key
 ### 3. Run the Stack
 **Backend**:
 ```bash
+cd backend
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 **Frontend**:
