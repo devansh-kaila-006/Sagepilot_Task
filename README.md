@@ -33,7 +33,7 @@ Copy `.env.example` to `.env` in the `backend/` directory:
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:[YOUR-PASSWORD]@db.xxxx.supabase.co:5432/postgres
 SUPABASE_URL=https://xxxx.supabase.co
-SUPABASE_KEY=your_supabase_key
+SUPABASE_ANON_KEY=your_supabase_anon_key
 
 GEMINI_API_KEY=your_gemini_api_key
 
