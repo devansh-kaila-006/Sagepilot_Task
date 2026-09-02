@@ -1,4 +1,4 @@
-# Order Supervisor AI (Production-Ready)
+# Order Supervisor AI (POC)
 
 An autonomous AI agent designed to oversee the lifecycle of e-commerce orders. Built with FastAPI (backend), Next.js (frontend), Supabase (PostgreSQL DB), and LangGraph (agent orchestration).
 
